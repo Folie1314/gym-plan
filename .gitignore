@@ -1,0 +1,17 @@
+# 虚拟环境
+.venv/
+venv/
+
+# 密钥
+.env
+
+# 数据库文件（由脚本重建，不提交）
+data/*.db
+data/*.db-journal
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
