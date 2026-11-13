@@ -24,6 +24,17 @@ CN_TZ = timezone(timedelta(hours=8))
 
 CYCLE = ["push", "pull", "legs"]
 
+# 场景 → 用户真正能用的器械。写死在代码里而不是读数据库：
+# 这是「用户能力」的定义，属于程序配置，不属于动作数据。
+SCENE_EQUIPMENT = {
+    "健身房（器械齐全）": ("器械", "哑铃", "杠铃", "自重"),
+    "家里（哑铃）": ("哑铃", "自重"),
+    "家里（自重）": ("自重",),
+}
+
+# 少于这个数就排不出一份像样的计划，宁可明确报错也不硬生成
+MIN_CANDIDATES = 4
+
 PATTERN_CN = {
     "push": "推（胸、肩、三头）",
     "pull": "拉（背、二头、后肩）",
@@ -83,20 +94,39 @@ def decide_pattern() -> str:
     return CYCLE[0]
 
 
-def candidates(pattern: str, per_muscle: int = 5, min_total: int = 12) -> list[dict]:
-    """按分化筛候选动作，每个肌群均衡取样。
+def equipment_for(scene: str) -> tuple[str, ...]:
+    """把场景翻译成器械白名单。未知场景按健身房处理，不抛错。"""
+    return SCENE_EQUIPMENT.get(scene, SCENE_EQUIPMENT["健身房（器械齐全）"])
 
-    不能用简单的 LIMIT：push 有 24 个动作，id 靠前的全是胸，
-    LIMIT 15 截下来三头一个都没有，模型只能全排胸部动作。
-    用窗口函数按 muscle 分组，每组各取前 per_muscle 个。
 
-    兜底：legs 的 16 个动作 muscle 全是「腿」，只有一个分组，
-    分组取会只剩 5 个。这种情况退回按难度取足 min_total 个。
+def candidates(
+    pattern: str,
+    equipment: tuple[str, ...] | None = None,
+    per_muscle: int = 5,
+    min_total: int = 12,
+) -> list[dict]:
+    """按分化 + 器械筛候选动作，每个肌群均衡取样。
+
+    两个坑都在这里踩过：
+    1. 不能用简单的 LIMIT：push 有 26 个动作，id 靠前的全是胸，
+       LIMIT 15 截下来三头一个都没有，模型只能全排胸部动作。
+       用窗口函数按 muscle 分组，每组各取前 per_muscle 个。
+    2. 器械条件必须落在 SQL 里，不能只写进 prompt。
+       曾经 prompt 里写着「家里只有哑铃」，模型照样排杠铃划船——
+       因为它只能从候选里挑，而候选里本来就有杠铃动作。
+
+    兜底：legs 的动作 muscle 全是「腿」，只有一个分组，
+    分组取会只剩 5 个。这种情况退回按难度取足 min_total 个（仍受器械约束）。
     """
+    equipment = equipment or SCENE_EQUIPMENT["健身房（器械齐全）"]
+    placeholders = ",".join("?" * len(equipment))
+    where = f"pattern = ? AND equipment IN ({placeholders})"
+    params = (pattern, *equipment)
+
     conn = get_conn()
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT name, muscle, equipment, difficulty
             FROM (
                 SELECT *,
@@ -104,24 +134,24 @@ def candidates(pattern: str, per_muscle: int = 5, min_total: int = 12) -> list[d
                            PARTITION BY muscle ORDER BY difficulty, id
                        ) AS rn
                 FROM exercises
-                WHERE pattern = ?
+                WHERE {where}
             )
             WHERE rn <= ?
             ORDER BY muscle, rn
             """,
-            (pattern, per_muscle),
+            (*params, per_muscle),
         ).fetchall()
 
         if len(rows) < min_total:
             rows = conn.execute(
-                """
+                f"""
                 SELECT name, muscle, equipment, difficulty
                 FROM exercises
-                WHERE pattern = ?
+                WHERE {where}
                 ORDER BY difficulty, id
                 LIMIT ?
                 """,
-                (pattern, min_total),
+                (*params, min_total),
             ).fetchall()
 
         return [dict(row) for row in rows]
@@ -143,13 +173,29 @@ def last_weight(exercise_name: str) -> float | None:
         conn.close()
 
 
-def build_prompt(pattern: str, cands: list[dict], recent: list[str]) -> str:
-    """把用户情况 + 候选动作拼成一段提示词。"""
+def build_prompt(
+    pattern: str,
+    cands: list[dict],
+    recent: list[str],
+    profile: dict | None = None,
+) -> str:
+    """把用户情况 + 候选动作拼成一段提示词。
+
+    profile 允许为空：命令行 main.py 不传，行为跟以前一致。
+    """
     names = "、".join(c["name"] for c in cands)
     recent_text = "；".join(recent) if recent else "无记录（今天开始）"
 
+    profile = profile or {}
+    goal = profile.get("goal", "增肌")
+    equipment = profile.get("equipment", "健身房（器械齐全）")
+    status = profile.get("status", "正常")
+
     return f"""你是一名力量训练教练。为今天设计一份训练计划。
 
+【目标】{goal}
+【场地器械】{equipment}
+【今天状态】{status}
 【今日分化】{pattern} —— {PATTERN_CN[pattern]}
 【最近练过】{recent_text}
 【可选动作】（只能从这里选，禁止发明新动作）
@@ -159,7 +205,8 @@ def build_prompt(pattern: str, cands: list[dict], recent: list[str]) -> str:
 1. 选 4–6 个动作，覆盖不同肌群
 2. 每个动作 3–4 组，8–12 次
 3. 重量先填 0，表示由用户自己决定
-4. 只输出 JSON 本体，不要 markdown 代码块，不要任何解释
+4. 今天状态为「累」时，组数减到 2–3 组，不要硬冲
+5. 只输出 JSON 本体，不要 markdown 代码块，不要任何解释
 
 输出格式：
 {{"pattern": "{pattern}", "exercises": [{{"name": "动作名", "sets": 3, "reps": 10, "weight_kg": 0, "note": "一句要点"}}]}}
@@ -217,15 +264,25 @@ def parse_and_validate(raw: str, allowed: set[str]) -> dict:
     return plan
 
 
-def generate(pattern: str | None = None, max_retries: int = 3) -> dict:
+def generate(
+    pattern: str | None = None,
+    profile: dict | None = None,
+    max_retries: int = 3,
+) -> dict:
     """生成今天的计划。返回解析并校验过的字典。"""
+    profile = profile or {}
     pattern = pattern or decide_pattern()
-    cands = candidates(pattern)
-    if not cands:
-        raise RuntimeError(f"动作库里没有 pattern={pattern} 的动作")
+    scene = profile.get("equipment", "健身房（器械齐全）")
+    cands = candidates(pattern, equipment_for(scene))
+
+    if len(cands) < MIN_CANDIDATES:
+        raise RuntimeError(
+            f"「{scene}」场景下 {PATTERN_CN[pattern]} 只有 {len(cands)} 个可用动作，"
+            f"排不出一份计划。需要补动作库，不是模型的问题。"
+        )
 
     allowed = {c["name"] for c in cands}
-    prompt = build_prompt(pattern, cands, recent_patterns())
+    prompt = build_prompt(pattern, cands, recent_patterns(), profile)
 
     last_err = None
     for attempt in range(1, max_retries + 1):
